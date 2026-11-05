@@ -1,0 +1,10 @@
+[package]
+name = "CLIPTokenizer"
+module_roots = ["src", "tests", "tools"]
+
+[toolchain]
+git = "https://github.com/ziranlang/ziran.git"
+ref = "master"
+
+[exports]
+Tokenizer = "src/tokenizer.zi"

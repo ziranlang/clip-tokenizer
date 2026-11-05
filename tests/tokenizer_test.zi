@@ -1,0 +1,119 @@
+T :: #import "tokenizer";
+F :: #import "fixtures";
+J :: #import "std/json_document";
+using Vectors :: #import "std/vec";
+Fixture :: (goldens: bool, output: *Vec(u8)) -> bool {
+    count: s32 = cast(s32)F.TinyCount
+    if goldens { count = cast(s32)F.GoldensCount }
+    for at: 0..count-1 {
+        value := ifx goldens then F.Goldens(at) else F.Tiny(at)
+        if !BuilderAppend(<<output,value) { return false }
+    }
+    return true
+}
+
+Compare :: (model: *T.Model, doc: *J.JsonDocument, row: s32) -> bool {
+    text: Vec(u8)
+    if !J.JsonStringInto(doc,J.JsonMember(doc,row,"text"),*text) { return false }
+    ids: [77]s64
+    if !T.Encode77(model,TextView(VecSlice(text,0,text.count)),ids[:]) { return false }
+    expected := J.JsonMember(doc,row,"ids")
+    if J.JsonCount(doc,expected) != 77 { return false }
+    child := J.JsonFirst(doc,expected); at: s64
+    while child >= 0 {
+        id,ok := J.JsonInteger(doc,child)
+        if !ok || id != ids[at] { print("golden mismatch at token %: got % expected %\n",at,ids[at],id); return false }
+        at += 1; child = J.JsonNext(doc,child)
+    }
+    return at == 77
+}
+Invalid :: (model: *T.Model) -> bool {
+    ids: [77]s64
+    malformed: [6]u8 = .[255,192,175,237,160,128]
+    for length: 1..6 {
+        for at: 0..76 { ids[at] = 99 }
+        if T.Encode77(model,TextView(malformed[0:length]),ids[:]) { return false }
+        for id: ids { if id != 0 { return false } }
+    }
+    too_long: [4097]u8
+    for at: 0..4096 { too_long[at] = 120 }
+    if T.Encode77(model,TextView(too_long[:]),ids[:]) { return false }
+    short: [76]s64
+    if T.Encode77(model,"valid",short[:]) { return false }
+    return true
+}
+Failure :: (text: string) -> bool {
+    model: T.Model; defer { T.Close(*model) }
+    if T.LoadJSON(*model,text) || model.ready { return false }
+    return true
+}
+MalformedModels :: () -> bool {
+    malformed: [1]u8 = .[255]
+    if !Failure("") || !Failure("{}") || !Failure("[]") || !Failure("{\"model\":") || !Failure(TextView(malformed[:])) { return false }
+    doc: J.JsonDocument; defer { J.JsonReset(*doc) }
+    source: Vec(u8)
+    if !Fixture(false,*source) { return false }
+    // Modify independent fixture fields through JSON, never implementation
+    // internals. Every unsupported pipeline must fail closed and be reusable.
+    if !J.JsonRead(*doc,TextView(VecSlice(source,0,source.count))) { return false }
+    normal := J.JsonMember(*doc,doc.root,"normalizer")
+    J.JsonSet(*doc,normal,"type",J.JsonNewStringCopy(*doc,"NFKC"))
+    wire: Vec(u8)
+    if !J.JsonWriteInto(*wire,*doc,doc.root,J.JsonCompactStyle()) || !Failure(TextView(VecSlice(wire,0,wire.count))) { return false }
+    J.JsonReset(*doc)
+    if !J.JsonRead(*doc,TextView(VecSlice(source,0,source.count))) { return false }
+    bpe := J.JsonMember(*doc,doc.root,"model")
+    J.JsonSet(*doc,bpe,"byte_fallback",J.JsonNewBool(*doc,true))
+    VecClear(wire)
+    if !J.JsonWriteInto(*wire,*doc,doc.root,J.JsonCompactStyle()) || !Failure(TextView(VecSlice(wire,0,wire.count))) { return false }
+    J.JsonReset(*doc)
+    if !J.JsonRead(*doc,TextView(VecSlice(source,0,source.count))) { return false }
+    bpe = J.JsonMember(*doc,doc.root,"model")
+    vocab := J.JsonMember(*doc,bpe,"vocab")
+    if !J.JsonSet(*doc,vocab,"!",J.JsonNewInteger(*doc,0)) { return false }
+    VecClear(wire)
+    if !J.JsonWriteInto(*wire,*doc,doc.root,J.JsonCompactStyle()) || !Failure(TextView(VecSlice(wire,0,wire.count))) { return false }
+    J.JsonReset(*doc)
+    if !J.JsonRead(*doc,TextView(VecSlice(source,0,source.count))) { return false }
+    bpe = J.JsonMember(*doc,doc.root,"model")
+    merges := J.JsonMember(*doc,bpe,"merges")
+    J.JsonClear(*doc,merges)
+    // A later merge result cannot be a source at rank zero.
+    if !J.JsonAppend(*doc,merges,J.JsonNewStringCopy(*doc,"ab c</w>")) { return false }
+    VecClear(wire)
+    if !J.JsonWriteInto(*wire,*doc,doc.root,J.JsonCompactStyle()) || !Failure(TextView(VecSlice(wire,0,wire.count))) { return false }
+    return true
+}
+#scope_export
+Check :: () -> s32 {
+    if !MalformedModels() { return 1 }
+    model: T.Model; defer { T.Close(*model) }
+    // Load copies its input; churn/release source before encoding.
+    source: Vec(u8)
+    if !Fixture(false,*source) || !T.LoadJSON(*model,TextView(VecSlice(source,0,source.count))) { return 2 }
+    {
+        released: Vec(u8); VecSwap(released,source)
+    }
+    doc: J.JsonDocument; defer { J.JsonReset(*doc) }
+    goldens: Vec(u8)
+    if !Fixture(true,*goldens) || !J.JsonRead(*doc,TextView(VecSlice(goldens,0,goldens.count))) { return 3 }
+    row := J.JsonFirst(*doc,doc.root); number: s32
+    while row >= 0 {
+        if !Compare(*model,*doc,row) { print("tiny-model row % failed\n",number); return 4 }
+        row = J.JsonNext(*doc,row); number += 1
+    }
+    if number < 20 || !Invalid(*model) { return 5 }
+    ids: [77]s64
+    for repeat: 0..127 { if !T.Encode77(*model,"cafe\xcc\x81 ΟΣ 🙂 abc xyz",ids[:]) { return 6 } }
+    T.Close(*model); T.Close(*model)
+    if T.Encode77(*model,"abc",ids[:]) { return 7 }
+    for repeat: 0..7 {
+        VecClear(source)
+        if !Fixture(false,*source) || !T.LoadJSON(*model,TextView(VecSlice(source,0,source.count))) || !T.Encode77(*model,"abc xyz",ids[:]) { return 8 }
+        T.Close(*model)
+    }
+    if !T.LoadJSON(*model,TextView(VecSlice(source,0,source.count))) || T.LoadJSON(*model,"{}") || model.ready { return 9 }
+    return 0
+}
+#program_export
+main :: () -> s32 { return Check() }

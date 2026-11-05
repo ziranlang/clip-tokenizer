@@ -1,0 +1,3 @@
+Tests :: #import "tokenizer_test";
+#program_export
+main :: () -> s32 { return Tests.Check() }

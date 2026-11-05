@@ -1,0 +1,44 @@
+T :: #import "tokenizer";
+F :: #import "fixtures";
+using Vectors :: #import "std/vec";
+
+#scope_file
+model: T.Model;
+Fixture :: (out: *Vec(u8)) -> bool {
+    for at: 0..cast(s32)F.TinyCount-1 { if !BuilderAppend(<<out,F.Tiny(at)) { return false } }
+    return true
+}
+#scope_export
+#program_export
+Prepare :: () -> s32 {
+    bytes: Vec(u8)
+    return ifx Fixture(*bytes) && T.LoadJSON(*model,TextView(VecSlice(bytes,0,bytes.count))) then 42 else 1
+}
+#program_export
+Exercise :: () -> s32 {
+    ids: [77]s64
+    if !T.Encode77(*model,"cafe\xcc\x81 ΟΣ 🙂 ١٢٣ abc xyz <|ENDOFTEXT|>",ids[:]) {
+        for id: ids { if id != 0 { return 2 } }
+        return 0
+    }
+    return ifx ids[0] == model.bos && ids[76] == model.eos then 42 else 3
+}
+#program_export
+LoadOnce :: () -> s32 {
+    candidate: T.Model; defer { T.Close(*candidate) }
+    bytes: Vec(u8)
+    if !Fixture(*bytes) { return 0 }
+    ok := T.LoadJSON(*candidate,TextView(VecSlice(bytes,0,bytes.count)))
+    if !ok {
+        if candidate.ready { return 2 }
+        // The injected allocator rejects once; the same failed Model must be
+        // reloadable and encodable immediately after that rejection.
+        if !T.LoadJSON(*candidate,TextView(VecSlice(bytes,0,bytes.count))) { return 3 }
+        recovered: [77]s64
+        return ifx T.Encode77(*candidate,"abc xyz",recovered[:]) then 0 else 3
+    }
+    ids: [77]s64
+    return ifx T.Encode77(*candidate,"abc xyz",ids[:]) then 42 else 0
+}
+#program_export
+Finish :: () { T.Close(*model) }

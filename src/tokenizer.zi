@@ -1,0 +1,451 @@
+// Portable CLIP byte-level BPE. All model storage belongs to Model; no I/O,
+// host regex, locale, Python runtime or hidden process-global cache.
+U :: #import "std/unicode";
+UTF8 :: #import "std/utf8";
+J :: #import "std/json_document";
+using Vectors :: #import "std/vec";
+
+#scope_export
+SequenceLength :: 77;
+// Resource ceiling for this bounded tokenizer API, independent of applications'
+// own query validation (Photos, for example, accepts 512 original bytes).
+MaxInputBytes :: 4096;
+MaxModelBytes :: 8388608;
+MaxVocabulary :: 65536;
+MaxMerges :: 100000;
+// Unicode17 canonical recursive decomposition has at most four scalars;
+// lowercase at most three, each encoded in at most four UTF-8 bytes.
+MaxNormalizedBytes :: MaxInputBytes * 4 * 3 * 4;
+Token :: struct { offset: s64; length: s64; }
+Merge :: struct { left: s32; right: s32; result: s32; }
+Model :: struct {
+    source: Vec(u8)
+    bytes: Vec(u8)
+    tokens: Vec(Token)
+    token_slots: Vec(s32)
+    merges: Vec(Merge)
+    merge_slots: Vec(s32)
+    initial: [256]s32
+    final: [256]s32
+    bos: s32
+    eos: s32
+    ready: bool
+}
+
+// Invalidates all model state and releases every owned allocation. Idempotent.
+// Do not copy Model or close/reload it concurrently with Encode77.
+Close :: (model: *Model) {
+    if model == null { return }
+    model.ready = false
+    VecFree(model.source); VecFree(model.bytes); VecFree(model.tokens)
+    VecFree(model.token_slots); VecFree(model.merges); VecFree(model.merge_slots)
+    model.bos = 0; model.eos = 0
+    for at: 0..255 { model.initial[at] = -1; model.final[at] = -1 }
+}
+
+#scope_file
+BOS :: "<|startoftext|>";
+EOS :: "<|endoftext|>";
+Pattern :: "<\\|startoftext\\|>|<\\|endoftext\\|>|'s|'t|'re|'ve|'m|'ll|'d|[\\p{L}]+|[\\p{N}]|[^\\s\\p{L}\\p{N}]+";
+
+Hash :: (text: string) -> u64 {
+    hash: u64 = 14695981039346656037
+    for byte: text { hash = (hash ^ cast(u64)byte) * 1099511628211 }
+    return hash
+}
+PairHash :: (a: s32, b: s32) -> u64 {
+    value := (cast(u64)a << 32) | cast(u64)b
+    value = (value ^ (value >> 30)) * 13787848793156543929
+    value = (value ^ (value >> 27)) * 10723151780598845931
+    return value ^ (value >> 31)
+}
+TokenEqual :: (model: *Model, id: s32, text: string) -> bool {
+    if id < 0 || id >= model.tokens.count { return false }
+    t := model.tokens[id]
+    if t.length != text.count { return false }
+    for at: 0..t.length-1 { if model.bytes[t.offset+at] != text[at] { return false } }
+    return true
+}
+TokenHash :: (model: *Model, id: s32) -> u64 {
+    t := model.tokens[id]; hash: u64 = 14695981039346656037
+    for at: 0..t.length-1 { hash = (hash ^ cast(u64)model.bytes[t.offset+at]) * 1099511628211 }
+    return hash
+}
+SameToken :: (model: *Model, a: s32, b: s32) -> bool {
+    x := model.tokens[a]; y := model.tokens[b]
+    if x.length != y.length { return false }
+    for at: 0..x.length-1 { if model.bytes[x.offset+at] != model.bytes[y.offset+at] { return false } }
+    return true
+}
+Lookup :: (model: *Model, text: string) -> s32 {
+    if model.token_slots.count == 0 { return -1 }
+    mask := model.token_slots.count-1
+    slot := cast(s64)(Hash(text) & cast(u64)mask)
+    probes: s64
+    while probes < model.token_slots.count {
+        id := model.token_slots[slot]-1
+        if id < 0 { return -1 }
+        if TokenEqual(model,id,text) { return id }
+        slot = (slot+1)&mask; probes += 1
+    }
+    return -1
+}
+AddToken :: (model: *Model, id: s32) -> bool {
+    mask := model.token_slots.count-1
+    slot := cast(s64)(TokenHash(model,id)&cast(u64)mask)
+    probes: s64
+    while probes < model.token_slots.count {
+        old := model.token_slots[slot]-1
+        if old < 0 { model.token_slots[slot] = id+1; return true }
+        if SameToken(model,old,id) { return false }
+        slot = (slot+1)&mask; probes += 1
+    }
+    return false
+}
+Rank :: (model: *Model, a: s32, b: s32) -> s32 {
+    if model.merge_slots.count == 0 { return -1 }
+    mask := model.merge_slots.count-1
+    slot := cast(s64)(PairHash(a,b)&cast(u64)mask)
+    probes: s64
+    while probes < model.merge_slots.count {
+        rank := model.merge_slots[slot]-1
+        if rank < 0 { return -1 }
+        merge := model.merges[rank]
+        if merge.left == a && merge.right == b { return rank }
+        slot = (slot+1)&mask; probes += 1
+    }
+    return -1
+}
+AddMerge :: (model: *Model, rank: s32) -> bool {
+    merge := model.merges[rank]
+    mask := model.merge_slots.count-1
+    slot := cast(s64)(PairHash(merge.left,merge.right)&cast(u64)mask)
+    probes: s64
+    while probes < model.merge_slots.count {
+        old := model.merge_slots[slot]-1
+        if old < 0 { model.merge_slots[slot] = rank+1; return true }
+        m := model.merges[old]
+        if m.left == merge.left && m.right == merge.right { return false }
+        slot = (slot+1)&mask; probes += 1
+    }
+    return false
+}
+Capacity :: (count: s64) -> s64 {
+    result: s64 = 8
+    while result < count*2 { result *= 2 }
+    return result
+}
+// Bound structural work before JSON allocates its tree; JSON itself rejects
+// malformed grammar/escapes/depth. Limits are part of this model format API.
+Preflight :: (text: string) -> bool {
+    if text.count == 0 || text.count > MaxModelBytes || !UTF8.Valid(text) { return false }
+    quoted: bool; escaped: bool; structure: s32; depth: s32
+    for byte: text {
+        if byte == 0 { return false }
+        if quoted {
+            if escaped { escaped = false }
+            else if byte == 92 { escaped = true }
+            else if byte == 34 { quoted = false }
+        } else {
+            if byte == 34 { quoted = true; structure += 1 }
+            if byte == 123 || byte == 91 { depth += 1; structure += 1 }
+            if byte == 125 || byte == 93 { depth -= 1 }
+            if byte == 44 || byte == 58 { structure += 1 }
+            if depth < 0 || depth > 32 || structure > 400000 { return false }
+        }
+    }
+    return !quoted && depth == 0
+}
+Member :: (doc: *J.JsonDocument, node: s32, key: string) -> s32 { return J.JsonMember(doc,node,key) }
+Is :: (doc: *J.JsonDocument, node: s32, key: string, value: string) -> bool {
+    return J.JsonIs(doc,Member(doc,node,key),value)
+}
+Kind :: (doc: *J.JsonDocument, node: s32, key: string, expected: J.JsonKind) -> bool {
+    return J.JsonKindOf(doc,Member(doc,node,key)) == expected
+}
+Config :: (doc: *J.JsonDocument) -> bool {
+    root := doc.root
+    normal := Member(doc,root,"normalizer")
+    norms := Member(doc,normal,"normalizers")
+    if !Is(doc,normal,"type","Sequence") || J.JsonCount(doc,norms) != 3 { return false }
+    nfc := J.JsonFirst(doc,norms); replace := J.JsonNext(doc,nfc); lower := J.JsonNext(doc,replace)
+    if !Is(doc,nfc,"type","NFC") || !Is(doc,replace,"type","Replace") || !Is(doc,lower,"type","Lowercase") ||
+       !Is(doc,replace,"content"," ") || !Is(doc,Member(doc,replace,"pattern"),"Regex","\\s+") { return false }
+    pre := Member(doc,root,"pre_tokenizer"); stages := Member(doc,pre,"pretokenizers")
+    if !Is(doc,pre,"type","Sequence") || J.JsonCount(doc,stages) != 2 { return false }
+    split := J.JsonFirst(doc,stages); byte := J.JsonNext(doc,split)
+    if !Is(doc,split,"type","Split") || !Is(doc,split,"behavior","Removed") ||
+       !Kind(doc,split,"invert",J.JsonKind.True) || !Is(doc,Member(doc,split,"pattern"),"Regex",Pattern) ||
+       !Is(doc,byte,"type","ByteLevel") || !Kind(doc,byte,"add_prefix_space",J.JsonKind.False) ||
+       !Kind(doc,byte,"trim_offsets",J.JsonKind.True) || !Kind(doc,byte,"use_regex",J.JsonKind.True) { return false }
+    post := Member(doc,root,"post_processor")
+    if !Is(doc,post,"type","RobertaProcessing") || !Kind(doc,post,"trim_offsets",J.JsonKind.False) ||
+       !Kind(doc,post,"add_prefix_space",J.JsonKind.False) { return false }
+    bpe := Member(doc,root,"model")
+    return Is(doc,bpe,"type","BPE") && Kind(doc,bpe,"dropout",J.JsonKind.Null) &&
+        Is(doc,bpe,"unk_token",EOS) && Is(doc,bpe,"continuing_subword_prefix","") &&
+        Is(doc,bpe,"end_of_word_suffix","</w>") && Kind(doc,bpe,"fuse_unk",J.JsonKind.False) &&
+        Kind(doc,bpe,"byte_fallback",J.JsonKind.False)
+}
+LoadVocabulary :: (model: *Model, doc: *J.JsonDocument, vocab: s32) -> bool {
+    count := J.JsonCount(doc,vocab)
+    if J.JsonKindOf(doc,vocab) != J.JsonKind.Object || count < 514 || count > MaxVocabulary ||
+       !VecResize(model.tokens,cast(s64)count) || !VecResize(model.token_slots,Capacity(count)) { return false }
+    seen: Vec(u8)
+    if !VecResize(seen,cast(s64)count) { return false }
+    child := J.JsonFirst(doc,vocab)
+    while child >= 0 {
+        id,ok := J.JsonInteger(doc,child)
+        if !ok || id < 0 || id >= count || seen[id] != 0 { return false }
+        seen[id] = 1
+        key: Vec(u8)
+        if !J.JsonKeyInto(doc,child,*key) || key.count == 0 || key.count > 4096 { return false }
+        if !UTF8.Valid(TextView(VecSlice(key,0,key.count))) { return false }
+        offset := model.bytes.count
+        for byte: VecSlice(key,0,key.count) { if !VecPush(model.bytes,byte) { return false } }
+        model.tokens[id].offset = offset; model.tokens[id].length = key.count
+        child = J.JsonNext(doc,child)
+    }
+    for id: 0..count-1 { if !AddToken(model,cast(s32)id) { return false } }
+    model.bos = Lookup(model,BOS); model.eos = Lookup(model,EOS)
+    return model.bos >= 0 && model.eos >= 0 && model.bos != model.eos
+}
+Added :: (model: *Model, doc: *J.JsonDocument) -> bool {
+    added := Member(doc,doc.root,"added_tokens")
+    if J.JsonKindOf(doc,added) != J.JsonKind.Array || J.JsonCount(doc,added) != 2 { return false }
+    got_bos: bool; got_eos: bool
+    child := J.JsonFirst(doc,added)
+    while child >= 0 {
+        id,ok := J.JsonInteger(doc,Member(doc,child,"id"))
+        if !ok || !Kind(doc,child,"single_word",J.JsonKind.False) || !Kind(doc,child,"lstrip",J.JsonKind.False) ||
+           !Kind(doc,child,"rstrip",J.JsonKind.False) || !Kind(doc,child,"special",J.JsonKind.True) { return false }
+        if id == model.bos && Is(doc,child,"content",BOS) && Kind(doc,child,"normalized",J.JsonKind.True) && !got_bos { got_bos = true }
+        else if id == model.eos && Is(doc,child,"content",EOS) && Kind(doc,child,"normalized",J.JsonKind.False) && !got_eos { got_eos = true }
+        else { return false }
+        child = J.JsonNext(doc,child)
+    }
+    post := Member(doc,doc.root,"post_processor")
+    cls := Member(doc,post,"cls"); sep := Member(doc,post,"sep")
+    if J.JsonCount(doc,cls) != 2 || J.JsonCount(doc,sep) != 2 ||
+       !J.JsonIs(doc,J.JsonFirst(doc,cls),BOS) || !J.JsonIs(doc,J.JsonFirst(doc,sep),EOS) { return false }
+    cls_id,cok := J.JsonInteger(doc,J.JsonNext(doc,J.JsonFirst(doc,cls)))
+    sep_id,sok := J.JsonInteger(doc,J.JsonNext(doc,J.JsonFirst(doc,sep)))
+    return got_bos && got_eos && cok && sok && cls_id == model.bos && sep_id == model.eos
+}
+Alphabet :: (model: *Model) -> bool {
+    next: s32 = 256
+    for byte: 0..255 {
+        point := byte
+        if !((byte >= 33 && byte <= 126) || (byte >= 161 && byte <= 172) || byte >= 174) { point = next; next += 1 }
+        name: Vec(u8)
+        if point < 128 { if !VecPush(name,cast(u8)point) { return false } }
+        else if !VecPush(name,cast(u8)(192 | (point>>6))) || !VecPush(name,cast(u8)(128 | (point&63))) { return false }
+        model.initial[byte] = Lookup(model,TextView(VecSlice(name,0,name.count)))
+        if !BuilderAppend(name,"</w>") { return false }
+        model.final[byte] = Lookup(model,TextView(VecSlice(name,0,name.count)))
+        if model.initial[byte] < 0 || model.final[byte] < 0 { return false }
+    }
+    return true
+}
+LoadMerges :: (model: *Model, doc: *J.JsonDocument, array: s32) -> bool {
+    count := J.JsonCount(doc,array)
+    if J.JsonKindOf(doc,array) != J.JsonKind.Array || count > MaxMerges || !VecResize(model.merges,cast(s64)count) ||
+       !VecResize(model.merge_slots,Capacity(count)) { return false }
+    available: Vec(u8)
+    if !VecResize(available,model.tokens.count) { return false }
+    for byte: 0..255 { available[model.initial[byte]] = 1; available[model.final[byte]] = 1 }
+    child := J.JsonFirst(doc,array); rank: s32
+    while child >= 0 {
+        wire: Vec(u8)
+        if !J.JsonStringInto(doc,child,*wire) || wire.count > 8193 { return false }
+        text := TextView(VecSlice(wire,0,wire.count)); space: s64 = -1
+        for at: 0..text.count-1 { if text[at] == 32 { if space >= 0 { return false }; space = at } }
+        if space <= 0 || space == text.count-1 { return false }
+        left := Lookup(model,text[0:space]); right := Lookup(model,text[space+1:text.count])
+        if left < 0 || right < 0 || available[left] == 0 || available[right] == 0 { return false }
+        joined: Vec(u8)
+        if !BuilderAppend(joined,text[0:space]) || !BuilderAppend(joined,text[space+1:text.count]) { return false }
+        result := Lookup(model,TextView(VecSlice(joined,0,joined.count)))
+        if result < 0 || result == model.bos || result == model.eos { return false }
+        model.merges[rank].left = left; model.merges[rank].right = right; model.merges[rank].result = result
+        if !AddMerge(model,rank) { return false }
+        available[result] = 1
+        rank += 1; child = J.JsonNext(doc,child)
+    }
+    return rank == count
+}
+LoadParsed :: (model: *Model, text: string) -> bool {
+    doc: J.JsonDocument; defer { J.JsonReset(*doc) }
+    if !J.JsonRead(*doc,text) || !Config(*doc) { return false }
+    bpe := Member(*doc,doc.root,"model")
+    return LoadVocabulary(model,*doc,Member(*doc,bpe,"vocab")) && Added(model,*doc) && Alphabet(model) &&
+        LoadMerges(model,*doc,Member(*doc,bpe,"merges"))
+}
+Load :: (model: *Model, text: string) -> bool {
+    if !Preflight(text) { return false }
+    source: Vec(u8)
+    if !BuilderAppend(source,text) { return false }
+    result := LoadParsed(model,TextView(VecSlice(source,0,source.count)))
+    VecSwap(model.source,source)
+    return result
+}
+
+#scope_export
+// Validate/copy once. Source can be discarded immediately after return. This
+// replaces any prior model; failure leaves a closed, reusable empty Model.
+// Only the documented CLIP pipeline is accepted, never silently approximated.
+LoadJSON :: (model: *Model, text: string) -> bool {
+    if model == null { return false }
+    Close(model)
+    if !Load(model,text) { Close(model); return false }
+    model.ready = true
+    return true
+}
+
+#scope_file
+Starts :: (text: string, at: s64, needle: string) -> bool {
+    return at >= 0 && needle.count <= text.count-at && text[at:at+needle.count] == needle
+}
+Decoded :: (text: string, at: s64) -> UTF8.Decoded {
+    length := text.count-at
+    if length > 4 { length = 4 }
+    return UTF8.Decode(text[at:at+length],0)
+}
+Category :: (point: u32) -> s32 {
+    if U.IsWhiteSpace(point) { return 0 }
+    if U.IsLetter(point) { return 1 }
+    if U.IsNumber(point) { return 2 }
+    return 3
+}
+Contraction :: (text: string, at: s64) -> s64 {
+    if !Starts(text,at,"'") { return 0 }
+    endings: [7]string = .["s","t","re","ve","m","ll","d"]
+    for ending: endings { if Starts(text,at+1,ending) { return ending.count+1 } }
+    return 0
+}
+AppendID :: (output: []s64, count: *s64, id: s32) {
+    // Body is truncated at 75; EOS is always placed at or before index 76.
+    if count.* < 76 { output[count.*] = id; count.* += 1 }
+}
+BPE :: (model: *Model, text: string, output: []s64, count: *s64) -> bool {
+    if text.count == 0 || count.* >= 76 { return true }
+    if text.count > MaxNormalizedBytes { return false }
+    tokens: Vec(s32)
+    if !VecResize(tokens,text.count) { return false }
+    length := text.count
+    for at: 0..length-1 {
+        tokens[at] = ifx at == length-1 then model.final[text[at]] else model.initial[text[at]]
+    }
+    while length > 1 {
+        best: s32 = -1; where: s64 = -1
+        for at: 0..length-2 {
+            rank := Rank(model,tokens[at],tokens[at+1])
+            if rank >= 0 && (best < 0 || rank < best) { best = rank; where = at }
+        }
+        if best < 0 { break }
+        tokens[where] = model.merges[best].result
+        at := where+1
+        while at < length-1 { tokens[at] = tokens[at+1]; at += 1 }
+        length -= 1
+    }
+    for at: 0..length-1 { AppendID(output,count,tokens[at]) }
+    return true
+}
+// ByteLevel's second regex sees no whitespace in the first Split's pieces.
+// Its letter/number/punctuation alternatives still split a literal special
+// spelling when that spelling was not extracted as an added token.
+ByteLevel :: (model: *Model, text: string, output: []s64, count: *s64) -> bool {
+    at: s64
+    while at < text.count {
+        end := at+Contraction(text,at)
+        if end == at {
+            d := Decoded(text,at); category := Category(d.value); end = at+d.after
+            while end < text.count && Category(Decoded(text,end).value) == category { end += Decoded(text,end).after }
+        }
+        if !BPE(model,text[at:end],output,count) { return false }
+        at = end
+    }
+    return true
+}
+Pieces :: (model: *Model, text: string, output: []s64, count: *s64) -> bool {
+    at: s64
+    while at < text.count {
+        if Starts(text,at,BOS) { AppendID(output,count,model.bos); at += BOS.count; continue }
+        if Category(Decoded(text,at).value) == 0 { at += Decoded(text,at).after; continue }
+        end := at+Contraction(text,at)
+        if Starts(text,at,EOS) { end = at+EOS.count }
+        if end == at {
+            d := Decoded(text,at); category := Category(d.value); end = at+d.after
+            if category != 2 {
+                while end < text.count && Category(Decoded(text,end).value) == category && !Starts(text,end,BOS) {
+                    end += Decoded(text,end).after
+                }
+            }
+        }
+        if !ByteLevel(model,text[at:end],output,count) { return false }
+        at = end
+    }
+    return true
+}
+Normalized :: (model: *Model, text: string, output: []s64, count: *s64) -> bool {
+    nfc: Vec(u8)
+    if !U.NFCInto(text,*nfc) { return false }
+    collapsed: Vec(u8)
+    {
+        wire := TextView(VecSlice(nfc,0,nfc.count)); at: s64; space: bool
+        while at < wire.count {
+            d := Decoded(wire,at)
+            if U.IsWhiteSpace(d.value) {
+                if !space && !VecPush(collapsed,32) { return false }
+                space = true
+            } else {
+                for byte: wire[at:at+d.after] { if !VecPush(collapsed,byte) { return false } }
+                space = false
+            }
+            at += d.after
+        }
+    }
+    lower: Vec(u8)
+    scalar: Vec(u8)
+    {
+        wire := TextView(VecSlice(collapsed,0,collapsed.count)); at: s64
+        while at < wire.count {
+            d := Decoded(wire,at)
+            // HF Lowercase maps each scalar independently. Full-string
+            // contextual lowercase would incorrectly emit Greek final sigma.
+            if !U.LowerInto(wire[at:at+d.after],*scalar) { return false }
+            for byte: VecSlice(scalar,0,scalar.count) { if !VecPush(lower,byte) { return false } }
+            at += d.after
+        }
+    }
+    if lower.count > MaxNormalizedBytes { return false }
+    return Pieces(model,TextView(VecSlice(lower,0,lower.count)),output,count)
+}
+Encode :: (model: *Model, text: string, output: []s64) -> bool {
+    if !model.ready || text.count > MaxInputBytes || !UTF8.Valid(text) { return false }
+    output[0] = model.bos
+    for at: 1..76 { output[at] = model.eos }
+    count: s64 = 1
+    at: s64; begin: s64
+    while at < text.count {
+        // Non-normalized added EOS is recognized on the original input.
+        if Starts(text,at,EOS) {
+            if !Normalized(model,text[begin:at],output,*count) { return false }
+            AppendID(output,*count,model.eos); at += EOS.count; begin = at
+        } else { at += Decoded(text,at).after }
+    }
+    return Normalized(model,text[begin:text.count],output,*count)
+}
+#scope_export
+// Exactly 77 caller-owned signed 64-bit IDs, BOS + up to 75 body + EOS, padded
+// with EOS. HF semantics include empty/whitespace input and embedded NUL.
+// Reject malformed UTF-8 or >MaxInputBytes original bytes. Application-specific
+// blank/NUL/length/strip rules belong to its adapter before this call.
+// No mutation of Model; reusable/concurrent reads with separate outputs work.
+// On failure every supplied output element is zeroed, including wrong lengths.
+Encode77 :: (model: *Model, text: string, output: []s64) -> bool {
+    for at: 0..output.count-1 { output[at] = 0 }
+    if model == null || output.count != SequenceLength { return false }
+    if !Encode(model,text,output) { for at: 0..output.count-1 { output[at] = 0 }; return false }
+    return true
+}
