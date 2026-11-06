@@ -1,6 +1,9 @@
 .DEFAULT_GOAL := check
-ZIRAN ?= ../../ziran/build/bin/ziran
+# The locked toolchain, fetched and built on first use, or the checkout an
+# ignored ziran.local.toml names; ZIRAN=path/to/ziran replaces both.
+LOCK_FLAGS := $(if $(wildcard ziran.local.toml),,--locked)
 .PHONY: check
-# Invoke through build-queue; direct canonical paths need no clone or fetch.
+# Invoke through build-queue.
 check:
-	sh tests/check.sh $(ZIRAN)
+	$(if $(ZIRAN),,$(if $(wildcard ziran.local.toml),,ziran fetch --locked))
+	sh tests/check.sh "$(or $(ZIRAN),$$(ziran pkg path ziran $(LOCK_FLAGS))/build/bin/ziran)"

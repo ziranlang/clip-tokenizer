@@ -62,8 +62,8 @@ U+001C..U+001F). Internal controls are ordinary tokenizer bytes; HF's regex
 whitespace uses `IsWhiteSpace` instead. The Photos integration unit compares
 this boundary against the actual pinned public tokenizer.
 
-Run local tests from this canonical package, using the current canonical
-toolchain (no dependency checkout/fetch):
+Run local tests on the locked toolchain, which `make check` fetches and builds
+on first use; `ZIRAN=path/to/ziran` runs them on another:
 
 ```sh
 build-queue -- make check
