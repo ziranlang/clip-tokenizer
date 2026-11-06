@@ -25,7 +25,7 @@ for form in source saved; do
     fi
     "$ziran" bundle "$@" --entry check:main -o "$work/$form.zx" "$input"
     run_vm "$ziran" run "$work/$form.zx"
-    run_vm "$(dirname "$ziran")/zi2zx-vm" run "$work/$form.zx"
+    run_vm "$(dirname "$ziran")/zi2zx" run --vm "$work/$form.zx"
     for target in c go; do
         output="$work/$form-$target"
         if test "$target" = go; then

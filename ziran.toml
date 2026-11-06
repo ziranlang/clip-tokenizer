@@ -4,7 +4,7 @@ module_roots = ["src", "tests", "tools"]
 
 [toolchain]
 git = "https://github.com/ziranlang/ziran.git"
-ref = "master"
+ref = "5fe70de6960b2fb8f01164c6643687adfba94156"
 
 [exports]
 Tokenizer = "src/tokenizer.zi"
